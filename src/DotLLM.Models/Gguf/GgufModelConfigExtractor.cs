@@ -64,7 +64,7 @@ public static class GgufModelConfigExtractor
             "llama" => Architecture.Llama,
             "mistral" => Architecture.Mistral,
             "phi" => Architecture.Phi,
-            "qwen" or "qwen2" => Architecture.Qwen,
+            "qwen" or "qwen2" or "qwen3" => Architecture.Qwen,
             "deepseek" or "deepseek2" => Architecture.DeepSeek,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };

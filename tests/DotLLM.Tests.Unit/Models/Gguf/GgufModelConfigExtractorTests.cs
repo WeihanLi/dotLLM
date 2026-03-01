@@ -207,6 +207,7 @@ public class GgufModelConfigExtractorTests
     [InlineData("phi", Architecture.Phi)]
     [InlineData("qwen", Architecture.Qwen)]
     [InlineData("qwen2", Architecture.Qwen)]
+    [InlineData("qwen3", Architecture.Qwen)]
     [InlineData("deepseek", Architecture.DeepSeek)]
     [InlineData("deepseek2", Architecture.DeepSeek)]
     public void Extract_ArchitectureParsing(string archString, Architecture expected)

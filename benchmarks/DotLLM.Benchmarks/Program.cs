@@ -1,3 +1,3 @@
-// Benchmark runner entry point — add benchmark classes and run with:
-// dotnet run -c Release -- --filter *
-Console.WriteLine("dotLLM Benchmarks");
+using BenchmarkDotNet.Running;
+
+BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);

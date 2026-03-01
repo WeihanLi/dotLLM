@@ -11,7 +11,8 @@
       "Bash(gh repo:*)",
       "Bash(ls:*)",
       "Bash(gh issue:*)",
-      "Bash(gh label:*)"
+      "Bash(gh label:*)",
+      "Bash(xargs grep:*)"
     ]
   }
 }

@@ -2,6 +2,26 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/DotLLM.Benchmarks/DotLLM.Benchmarks.csproj" />
   </Folder>
+  <Folder Name="/docs/">
+    <File Path="docs/ARCHITECTURE.md" />
+    <File Path="docs/ATTENTION.md" />
+    <File Path="docs/CONSTRAINED_DECODING.md" />
+    <File Path="docs/DIAGNOSTICS.md" />
+    <File Path="docs/GGUF_FORMAT.md" />
+    <File Path="docs/KV_CACHE.md" />
+    <File Path="docs/LORA.md" />
+    <File Path="docs/MODEL_CONFIG.md" />
+    <File Path="docs/MULTI_GPU.md" />
+    <File Path="docs/POSITION_ENCODING.md" />
+    <File Path="docs/QUANTIZATION.md" />
+    <File Path="docs/ROADMAP.md" />
+    <File Path="docs/SAMPLING.md" />
+    <File Path="docs/SCHEDULING.md" />
+    <File Path="docs/SERVER.md" />
+    <File Path="docs/SPECULATIVE.md" />
+    <File Path="docs/TELEMETRY.md" />
+    <File Path="docs/TOKENIZERS.md" />
+  </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/DotLLM.Sample.Console/DotLLM.Sample.Console.csproj" />
     <Project Path="samples/DotLLM.Sample.Interpretability/DotLLM.Sample.Interpretability.csproj" />
@@ -9,11 +29,13 @@
     <Project Path="samples/DotLLM.Sample.ToolCalling/DotLLM.Sample.ToolCalling.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/DotLLM.Cli/DotLLM.Cli.csproj" />
     <Project Path="src/DotLLM.Core/DotLLM.Core.csproj" />
     <Project Path="src/DotLLM.Cpu/DotLLM.Cpu.csproj" />
     <Project Path="src/DotLLM.Cuda/DotLLM.Cuda.csproj" />
     <Project Path="src/DotLLM.Diagnostics/DotLLM.Diagnostics.csproj" />
     <Project Path="src/DotLLM.Engine/DotLLM.Engine.csproj" />
+    <Project Path="src/DotLLM.HuggingFace/DotLLM.HuggingFace.csproj" />
     <Project Path="src/DotLLM.Models/DotLLM.Models.csproj" />
     <Project Path="src/DotLLM.Server/DotLLM.Server.csproj" />
     <Project Path="src/DotLLM.Telemetry/DotLLM.Telemetry.csproj" />

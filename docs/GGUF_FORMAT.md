@@ -144,6 +144,34 @@ ModelConfig.NumKvHeads = metadata[$"{arch}.attention.head_count_kv"] ?? NumAtten
 ModelConfig.RoPETheta = metadata[$"{arch}.rope.freq_base"] ?? 10000.0
 ```
 
+## Recommended Small GGUF Models for Development
+
+Models suitable for testing on machines with 4 GB VRAM. All sizes are approximate for Q4_K_M quantization.
+
+### Test Fixtures (tiny, fast download)
+
+| Repository | Size (Q4_K_M) | Use Case |
+|------------|---------------|----------|
+| `second-state/All-MiniLM-L6-v2-Embedding-GGUF` | ~23 MB | Parser validation, integration tests |
+| `Qwen/Qwen3-0.6B-GGUF` | ~400 MB | Smallest text-generation model |
+
+### Inference Testing (fits easily in 4 GB VRAM)
+
+| Repository | Params | Size (Q4_K_M) | Architecture |
+|------------|--------|---------------|--------------|
+| `bartowski/Llama-3.2-1B-Instruct-GGUF` | 1B | ~700 MB | Llama |
+| `bartowski/Qwen2.5-1.5B-Instruct-GGUF` | 1.5B | ~1 GB | Qwen2 |
+| `HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF` | 1.7B | ~1 GB | LlamaForCausalLM |
+
+### Largest That Fit 4 GB VRAM
+
+| Repository | Params | Size (Q4_K_M) | Architecture |
+|------------|--------|---------------|--------------|
+| `bartowski/Llama-3.2-3B-Instruct-GGUF` | 3B | ~2 GB | Llama |
+| `bartowski/Phi-3.5-mini-instruct-GGUF` | 3.8B | ~2.2 GB | Phi3 |
+
+**Default development model:** `bartowski/Llama-3.2-1B-Instruct-GGUF` — Llama architecture (primary target), small enough for fast iteration, large enough for coherent output.
+
 ## Reference
 
 - Spec: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md

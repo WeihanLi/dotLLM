@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>dotllm</ToolCommandName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
+    <ProjectReference Include="..\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+    <ProjectReference Include="..\DotLLM.Engine\DotLLM.Engine.csproj" />
+    <ProjectReference Include="..\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+    <ProjectReference Include="..\DotLLM.Server\DotLLM.Server.csproj" />
+    <ProjectReference Include="..\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" />
+    <PackageReference Include="Spectre.Console.Cli" />
+  </ItemGroup>
+
+</Project>

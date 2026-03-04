@@ -1,8 +1,8 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using DotLLM.Cli.Helpers;
 using DotLLM.Core.Models;
+using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using Spectre.Console;
@@ -68,7 +68,6 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
         loadSw.Stop();
 
         AnsiConsole.MarkupLine($"[grey]Model: {config.Architecture}, {config.NumLayers} layers, {config.HiddenSize} hidden, {config.VocabSize:N0} vocab[/]");
-        AnsiConsole.MarkupLine("[grey]Warning: No KV-cache — full context reprocessed each step (slow)[/]");
         AnsiConsole.WriteLine();
 
         try
@@ -77,15 +76,14 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
             int[] promptTokens = tokenizer.Encode(settings.Prompt);
             int promptLen = promptTokens.Length;
 
-            // Build the full token sequence (prompt + generated)
-            int maxSeqLen = promptLen + settings.MaxTokens;
-            var tokens = new List<int>(maxSeqLen);
-            tokens.AddRange(promptTokens);
-
-            // Pre-allocate positions array for the entire generation run
-            int[] positions = new int[maxSeqLen];
-            for (int i = 0; i < maxSeqLen; i++)
+            // Pre-allocate positions array and KV-cache (capped at model's max sequence length)
+            int cacheSize = Math.Min(promptLen + settings.MaxTokens, config.MaxSequenceLength);
+            int[] positions = new int[cacheSize];
+            for (int i = 0; i < cacheSize; i++)
                 positions[i] = i;
+
+            using var kvCache = new SimpleKvCache(
+                config.NumLayers, config.NumKvHeads, config.HeadDim, cacheSize);
 
             // Print prompt echo
             Console.Write(settings.Prompt);
@@ -95,52 +93,57 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
             long evalTicks = 0;
             long samplerTicks = 0;
             int generated = 0;
+            int vocabSize = config.VocabSize;
 
-            for (int step = 0; step < settings.MaxTokens; step++)
+            // Prefill: process all prompt tokens at once
+            long fwdStart = Stopwatch.GetTimestamp();
+            using var prefillLogits = model.Forward(
+                promptTokens, positions.AsSpan(0, promptLen), -1, kvCache);
+            long fwdEnd = Stopwatch.GetTimestamp();
+            promptEvalTicks = fwdEnd - fwdStart;
+
+            // Generate tokens only when max-tokens > 0
+            if (settings.MaxTokens > 0)
             {
-                int seqLen = tokens.Count;
-                var tokenSpan = CollectionsMarshal.AsSpan(tokens);
-
-                // Forward pass — returns [1, vocabSize] logits (last token only)
-                long fwdStart = Stopwatch.GetTimestamp();
-                using var logitsTensor = model.Forward(tokenSpan, positions.AsSpan(0, seqLen), -1);
-                long fwdEnd = Stopwatch.GetTimestamp();
-
-                if (step == 0)
-                    promptEvalTicks = fwdEnd - fwdStart;
-                else
-                    evalTicks += fwdEnd - fwdStart;
-
-                // Greedy argmax on logits
-                int vocabSize = config.VocabSize;
-                long samplerStart = Stopwatch.GetTimestamp();
+                // First generated token from prefill logits
+                int lastToken;
                 unsafe
                 {
-                    float* logits = (float*)logitsTensor.DataPointer;
+                    long samplerStart = Stopwatch.GetTimestamp();
+                    float* logitPtr = (float*)prefillLogits.DataPointer;
+                    lastToken = ArgMax(logitPtr, vocabSize);
+                    samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                }
 
-                    int bestId = 0;
-                    float bestVal = logits[0];
-                    for (int i = 1; i < vocabSize; i++)
-                    {
-                        if (logits[i] > bestVal)
-                        {
-                            bestVal = logits[i];
-                            bestId = i;
-                        }
-                    }
-                    long samplerEnd = Stopwatch.GetTimestamp();
-                    samplerTicks += samplerEnd - samplerStart;
-
-                    // Check EOS
-                    if (bestId == tokenizer.EosTokenId)
-                        break;
-
-                    tokens.Add(bestId);
+                if (lastToken != tokenizer.EosTokenId)
+                {
                     generated++;
+                    Console.Write(tokenizer.DecodeToken(lastToken));
 
-                    // Stream token text
-                    string tokenText = tokenizer.DecodeToken(bestId);
-                    Console.Write(tokenText);
+                    // Decode loop: single token per step
+                    for (int step = 1; step < settings.MaxTokens; step++)
+                    {
+                        int pos = promptLen + step - 1;
+                        fwdStart = Stopwatch.GetTimestamp();
+                        using var logitsTensor = model.Forward(
+                            [lastToken], positions.AsSpan(pos, 1), -1, kvCache);
+                        fwdEnd = Stopwatch.GetTimestamp();
+                        evalTicks += fwdEnd - fwdStart;
+
+                        unsafe
+                        {
+                            long samplerStart = Stopwatch.GetTimestamp();
+                            float* logitPtr = (float*)logitsTensor.DataPointer;
+                            lastToken = ArgMax(logitPtr, vocabSize);
+                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                        }
+
+                        if (lastToken == tokenizer.EosTokenId)
+                            break;
+
+                        generated++;
+                        Console.Write(tokenizer.DecodeToken(lastToken));
+                    }
                 }
             }
 
@@ -250,7 +253,8 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
             long fileSize = new FileInfo(resolvedPath).Length;
             long modelWeightsBytes = fileSize - gguf.DataSectionOffset;
             long computeBytes = model.ComputeMemoryBytes;
-            long totalMemory = modelWeightsBytes + computeBytes;
+            long kvCacheBytes = kvCache.AllocatedBytes;
+            long totalMemory = modelWeightsBytes + computeBytes + kvCacheBytes;
 
             var memTable = new Table()
                 .Border(TableBorder.Rounded)
@@ -261,6 +265,7 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
 
             memTable.AddRow("Model weights", $"{FormatHelpers.FormatMiB(modelWeightsBytes)}  [dim](memory-mapped)[/]");
             memTable.AddRow("Compute", FormatHelpers.FormatMiB(computeBytes));
+            memTable.AddRow("KV-cache", $"{FormatHelpers.FormatMiB(kvCacheBytes)}  [dim]({cacheSize} slots)[/]");
             memTable.AddRow("[bold]Total[/]", $"[bold]{FormatHelpers.FormatMiB(totalMemory)}[/]");
 
             AnsiConsole.Write(memTable);
@@ -273,4 +278,7 @@ internal sealed class RunCommand : Command<RunCommand.Settings>
 
         return 0;
     }
+
+    private static unsafe int ArgMax(float* logits, int count)
+        => System.Numerics.Tensors.TensorPrimitives.IndexOfMax(new ReadOnlySpan<float>(logits, count));
 }

@@ -162,9 +162,17 @@ public sealed unsafe class LlamaModel : IModel
             byte* preQuantNorm = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, seqLen, lw.QQuantType);
 
             // Batched Q/K/V projections (GEMM)
+            // Guard: only reuse preQuantNorm when target quant type is in the same family as QQuantType
             Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen, preQuantNorm);
-            Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen, preQuantNorm);
-            Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen, preQuantNorm);
+            Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen,
+                 IsCompatiblePreQuant(lw.QQuantType, lw.KQuantType) ? preQuantNorm : null);
+            Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen,
+                 IsCompatiblePreQuant(lw.QQuantType, lw.VQuantType) ? preQuantNorm : null);
+
+            // Optional bias: y = Wx + b (no-op when null)
+            AddBias(lw.QBias, q, lw.QOutputDim, seqLen);
+            AddBias(lw.KBias, k, lw.KOutputDim, seqLen);
+            AddBias(lw.VBias, v, lw.VOutputDim, seqLen);
 
             // d. RoPE (in-place on Q and K for all tokens)
             RoPE.Execute(
@@ -199,6 +207,7 @@ public sealed unsafe class LlamaModel : IModel
             // f. Batched O projection
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, numHeads * headDim, seqLen, lw.OQuantType);
             Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen, preQuantAttn);
+            AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
 
             // g. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
@@ -227,7 +236,10 @@ public sealed unsafe class LlamaModel : IModel
 
             // Batched Gate + Up projections
             Gemm(lw.GateWeight, lw.GateQuantType, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen, preQuantFfn);
-            Gemm(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen, preQuantFfn);
+            Gemm(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen,
+                 IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType) ? preQuantFfn : null);
+            AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
+            AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
             // SiLU + Multiply (element-wise, per token)
             for (int t = 0; t < seqLen; t++)
@@ -251,6 +263,7 @@ public sealed unsafe class LlamaModel : IModel
 
             // Batched Down projection (output into normOut as scratch)
             Gemm(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen, preQuantSilu);
+            AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
 
             // k. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
@@ -293,6 +306,21 @@ public sealed unsafe class LlamaModel : IModel
     }
 
     /// <summary>
+    /// Adds a bias vector [outputDim] to each row of a [seqLen, outputDim] output buffer.
+    /// No-op when <paramref name="bias"/> is null (zero overhead for bias-less models).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AddBias(float[]? bias, float* output, int outputDim, int seqLen)
+    {
+        if (bias is null) return;
+        for (int t = 0; t < seqLen; t++)
+        {
+            var row = new Span<float>(output + t * outputDim, outputDim);
+            TensorPrimitives.Add((ReadOnlySpan<float>)row, bias, row);
+        }
+    }
+
+    /// <summary>
     /// Dispatches to the appropriate GEMV kernel based on quantization type.
     /// Passes <see cref="_threadPool"/> for parallel execution.
     /// </summary>
@@ -303,16 +331,12 @@ public sealed unsafe class LlamaModel : IModel
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemvQ5_0((byte*)weights, x, y, m, k, _threadPool);
-        // K-quant types use dequant fallback until Q8_K input quantization is implemented.
-        // llama.cpp uses Q8_K (float32 scale, 256-element blocks) for K-quant vec_dot,
-        // but our fused kernels use Q8_0 (float16 scale, 32-element blocks).
-        // The float16 scale precision loss accumulates across 30 layers and causes gibberish.
-        //else if (qt == QuantizationType.Q4_K)
-        //    MatMul.GemvQ4_K((byte*)weights, x, y, m, k, _threadPool);
-        //else if (qt == QuantizationType.Q5_K)
-        //    MatMul.GemvQ5_K((byte*)weights, x, y, m, k, _threadPool);
-        //else if (qt == QuantizationType.Q6_K)
-        //    MatMul.GemvQ6_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q4_K)
+            MatMul.GemvQ4_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q5_K)
+            MatMul.GemvQ5_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q6_K)
+            MatMul.GemvQ6_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F32)
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
@@ -358,16 +382,12 @@ public sealed unsafe class LlamaModel : IModel
             MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
-        // K-quant types use dequant fallback until Q8_K input quantization is implemented.
-        // llama.cpp uses Q8_K (float32 scale, 256-element blocks) for K-quant vec_dot,
-        // but our fused kernels use Q8_0 (float16 scale, 32-element blocks).
-        // The float16 scale precision loss accumulates across 30 layers and causes gibberish.
-        //else if (qt == QuantizationType.Q4_K)
-        //    MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
-        //else if (qt == QuantizationType.Q5_K)
-        //    MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
-        //else if (qt == QuantizationType.Q6_K)
-        //    MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q4_K)
+            MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q5_K)
+            MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q6_K)
+            MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.F32)
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
@@ -390,26 +410,58 @@ public sealed unsafe class LlamaModel : IModel
     }
 
     /// <summary>
-    /// Pre-quantizes [seqLen, dim] f32 input to Q8_0 into <see cref="LlamaForwardState.InputQ8Scratch"/>.
-    /// Returns the scratch pointer if Q8_0 and seqLen &gt; 1, otherwise null (no benefit).
+    /// Returns true when a pre-quantized buffer produced for <paramref name="preQuantSource"/>
+    /// can be safely reused for a GEMM targeting <paramref name="target"/>.
+    /// K-quant types share Q8_K layout; Q8_0/Q5_0 share Q8_0 layout. Cross-family reuse
+    /// would misinterpret block layout (different sizes, missing bsums), corrupting output.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsCompatiblePreQuant(QuantizationType preQuantSource, QuantizationType target)
+    {
+        if (preQuantSource == target) return true;
+
+        bool sourceIsKQuant = preQuantSource is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+        bool targetIsKQuant = target is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+        if (sourceIsKQuant && targetIsKQuant) return true;
+
+        bool sourceIsQ8Family = preQuantSource is QuantizationType.Q8_0 or QuantizationType.Q5_0;
+        bool targetIsQ8Family = target is QuantizationType.Q8_0 or QuantizationType.Q5_0;
+        return sourceIsQ8Family && targetIsQ8Family;
+    }
+
+    /// <summary>
+    /// Pre-quantizes [seqLen, dim] f32 input for GEMM reuse across Q/K/V or Gate/Up projections.
+    /// K-quant types (Q4_K, Q5_K, Q6_K) use Q8_K (float32 scale, 256 elements/block).
+    /// Q8_0 and Q5_0 types use Q8_0 (Half scale, 32 elements/block).
+    /// Returns the scratch pointer if quantized, otherwise null.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte* QuantizeInput(float* input, byte* scratch, int dim, int seqLen,
                                        QuantizationType qt)
     {
-        bool isQuantized = qt == QuantizationType.Q8_0
-                          || qt == QuantizationType.Q5_0
-                          || qt == QuantizationType.Q4_K
-                          || qt == QuantizationType.Q5_K
-                          || qt == QuantizationType.Q6_K;
+        bool isKQuant = qt == QuantizationType.Q4_K
+                     || qt == QuantizationType.Q5_K
+                     || qt == QuantizationType.Q6_K;
+        bool isQ8Type = qt == QuantizationType.Q8_0
+                     || qt == QuantizationType.Q5_0;
 
-        if (!isQuantized || seqLen <= 1)
+        if (!isKQuant && !isQ8Type)
             return null;
 
-        int blockCount = dim / 32; // Q8_0GroupSize
-        int q8RowBytes = blockCount * 34; // Q8_0BlockBytes
-        for (int t = 0; t < seqLen; t++)
-            MatMul.QuantizeF32ToQ8_0(input + t * dim, scratch + t * q8RowBytes, dim);
+        if (isKQuant)
+        {
+            int blockCount = dim / 256; // Q8_K_GroupSize
+            int q8kRowBytes = blockCount * MatMul.Q8_K_BlockBytes;
+            for (int t = 0; t < seqLen; t++)
+                MatMul.QuantizeF32ToQ8_K(input + t * dim, scratch + t * q8kRowBytes, dim);
+        }
+        else
+        {
+            int blockCount = dim / Q8_0GroupSize;
+            int q8RowBytes = blockCount * Q8_0BlockBytes;
+            for (int t = 0; t < seqLen; t++)
+                MatMul.QuantizeF32ToQ8_0(input + t * dim, scratch + t * q8RowBytes, dim);
+        }
 
         return scratch;
     }

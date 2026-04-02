@@ -407,6 +407,7 @@ There is no NuGet package yet -- the project is in early development. Follow the
 
 ## News
 
+- **2026-04** — Tool calling — `IToolCallParser` implementations for Llama 3.1+, Hermes/Qwen, Mistral, and generic fallback. Auto-detection factory selects parser from model architecture and chat template content. `ToolCallSchemaBuilder` generates JSON Schema from tool definitions for constrained decoding (`tool_choice=required`). `ToolCallDetector` for post-generation detection, `StreamingToolCallAccumulator` for streaming. `--tools` and `--tool-choice` CLI options with multi-turn tool use in chat REPL. Parallel tool calls supported ([#82](https://github.com/kkokosa/dotLLM/issues/82))
 - **2026-04** — Regex + CFG constrained decoding — `RegexConstraint` compiles patterns to minimized DFA (Thompson NFA → subset construction → Hopcroft minimization) with equivalence-class compression. `GrammarConstraint` parses GBNF grammars into PDA with InlineArray-based call stack. Both use zero-alloc struct simulators and dictionary-cached token masks. `--response-format regex --pattern <pattern>` and `--response-format grammar --grammar <gbnf|@file>` CLI support ([#80](https://github.com/kkokosa/dotLLM/issues/80))
 - **2026-03** — JSON Schema constrained decoding — `JsonSchemaConstraint` layers schema tracking on `JsonCharParser` to enforce type constraints, required properties, enum values, nested structures. Schema compiled into flat node array with property-name tries. Zero-alloc `Clone()` via struct-copy. `--response-format json_schema --schema <json|@file>` CLI support ([#78](https://github.com/kkokosa/dotLLM/issues/78))
 - **2026-03** — **Phase 5 begins**: JSON mode constrained decoding — `JsonConstraint` FSM guarantees syntactically valid JSON output via per-token vocabulary masking. Stack-based PDA (RFC 8259), AVX2-vectorized logit masking, state-keyed mask cache. `--response-format json_object` CLI flag ([#76](https://github.com/kkokosa/dotLLM/issues/76))
@@ -442,7 +443,7 @@ There is no NuGet package yet -- the project is in early development. Follow the
 | **2 — Practical Local Inference** | Engine metrics, benchmarks, Q4_K_M, chat templates, streaming, multi-threading, more architectures | Done (10/10) |
 | **3 — CPU Performance** | Decode dispatch, Q8_1 input, weight repacking, outer-product GEMM, tiled attention, fast exp, fusion, NUMA | In Progress (7/8) |
 | **4 — GPU Acceleration** | CUDA backend, CPU/GPU hybrid, KV-cache quantization | Done (3/3) |
-| **5 — Constrained Decoding & API** | JSON mode, JSON Schema, regex/CFG, tool calling, logit bias, OpenAI API server | In Progress (3/6) |
+| **5 — Constrained Decoding & API** | JSON mode, JSON Schema, regex/CFG, tool calling, logit bias, OpenAI API server | In Progress (4/6) |
 | **6 — Production Serving** | Continuous batching, paged KV-cache, prompt caching, speculative decoding, metrics | Planned |
 | **7 — Expand** | Hooks, logit lens, LoRA, MLA, SAE, multi-GPU, ROCm | Planned |
 
@@ -458,6 +459,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed steps, dependencies, and mil
 - [Tokenizers & chat templates](docs/TOKENIZERS.md)
 - [Sampling pipeline](docs/SAMPLING.md)
 - [Constrained decoding](docs/CONSTRAINED_DECODING.md)
+- [Tool calling](docs/TOOL_CALLING.md)
 - [KV-cache management](docs/KV_CACHE.md)
 - [GPU inference](docs/GPU.md)
 - [CUDA backend architecture](docs/CUDA.md)

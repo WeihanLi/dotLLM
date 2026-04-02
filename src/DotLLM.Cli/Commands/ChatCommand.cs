@@ -1,15 +1,18 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using DotLLM.Cli.Helpers;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
+using DotLLM.Engine.Constraints;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
+using DotLLM.Tokenizers.ToolCallParsers;
 using Spectre.Console;
 using Spectre.Console.Cli;
 
@@ -142,6 +145,18 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [Description("GBNF grammar string or file path (prefixed with @) for grammar response format.")]
         public string? Grammar { get; set; }
 
+        /// <summary>Tool definitions.</summary>
+        [CommandOption("--tools")]
+        [Description("Tool definitions: JSON array string or file path (prefixed with @). " +
+                     "Each tool: {\"name\": \"...\", \"description\": \"...\", \"parameters\": {...}}.")]
+        public string? Tools { get; set; }
+
+        /// <summary>Tool choice strategy.</summary>
+        [CommandOption("--tool-choice")]
+        [Description("Tool choice: 'auto' (default), 'none', 'required', or a function name.")]
+        [DefaultValue("auto")]
+        public string ToolChoiceStr { get; set; } = "auto";
+
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
         [Description("KV-cache key quantization: f32 (default), q8_0, q4_0.")]
@@ -159,6 +174,12 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [Description("Mixed-precision window: recent N tokens in full precision (0 = all quantized). Only used when --cache-type-k or --cache-type-v is set.")]
         [DefaultValue(0)]
         public int CacheWindow { get; set; }
+
+        /// <summary>Verbose debug output.</summary>
+        [CommandOption("--verbose|-v")]
+        [Description("Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details.")]
+        [DefaultValue(false)]
+        public bool Verbose { get; set; }
     }
 
     /// <inheritdoc/>
@@ -223,13 +244,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         string eosTokenStr = tokenizer.DecodeToken(tokenizer.EosTokenId);
         IChatTemplate chatTemplate;
         var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer);
-        chatTemplate = jinjaTemplate ?? new JinjaChatTemplate(DefaultChatMlTemplate, bosTokenStr, eosTokenStr);
+        chatTemplate = jinjaTemplate ?? new JinjaChatTemplate(DefaultChatMlTemplateText, bosTokenStr, eosTokenStr);
+
+        // Parse tool definitions
+        ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
+        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+            ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
+            : null;
+        ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
 
         // Common end-of-turn markers used by chat templates.
         // The EOS stop condition handles eos_token_id, but the end-of-turn marker
         // may be a different token (e.g., <|im_end|> in ChatML, <|eot_id|> in Llama 3).
         var stopSequences = new List<string>();
-        foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>", "<|end|>", "</s>" })
+        foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>" })
         {
             if (marker != eosTokenStr) // avoid duplicate with EOS stop condition
                 stopSequences.Add(marker);
@@ -243,6 +271,28 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             "grammar" => BuildGrammarFormat(settings.Grammar),
             _ => null
         };
+
+        // When tool_choice is required or specific function, constrain output to valid tool call JSON
+        if (responseFormat is null && tools is { Length: > 0 })
+        {
+            string? argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments";
+            responseFormat = toolChoice switch
+            {
+                ToolChoice.Required => new Core.Configuration.ResponseFormat.JsonSchema
+                {
+                    Schema = ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey),
+                    Name = "tool_call"
+                },
+                ToolChoice.Function fn => new Core.Configuration.ResponseFormat.JsonSchema
+                {
+                    Schema = ToolCallSchemaBuilder.BuildForFunction(
+                        tools.First(t => t.Name == fn.Name), argumentsKey),
+                    Name = "tool_call"
+                },
+                _ => null // auto/none — no constraint
+            };
+        }
+
         var inferenceOptions = new InferenceOptions
         {
             Temperature = settings.Temperature,
@@ -266,7 +316,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             ? DotLLM.Cuda.CudaDevice.GetDevice(settings.Device.IndexOf(':') is int ci and > 0
                 ? int.Parse(settings.Device.AsSpan(ci + 1)) : 0).ToString()
             : $"{threadingInfo.EffectiveThreadCount} threads";
-        var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";
+        var toolsLabel = tools is { Length: > 0 } ? $" | {tools.Length} tool(s)" : "";
+        var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}{toolsLabel}";
         AnsiConsole.Write(new Rule($"[grey]dotllm chat | {Markup.Escape(segments)}[/]").LeftJustified());
         AnsiConsole.MarkupLine("[dim]Type /exit to quit, /clear to reset history, /system <text> to set system prompt.[/]");
         AnsiConsole.WriteLine();
@@ -301,7 +352,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         try
         {
-            await RunRepl(generator, chatTemplate, inferenceOptions, history, settings);
+            await RunRepl(generator, chatTemplate, inferenceOptions, history, settings, tools, toolCallParser, toolChoice, settings.Verbose);
         }
         finally
         {
@@ -317,7 +368,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         IChatTemplate chatTemplate,
         InferenceOptions options,
         List<ChatMessage> history,
-        Settings settings)
+        Settings settings,
+        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
+        ToolChoice toolChoice,
+        bool verbose)
     {
         while (true)
         {
@@ -363,60 +418,209 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 continue;
             }
 
+            if (input.Equals("/tools", StringComparison.OrdinalIgnoreCase))
+            {
+                if (tools is not { Length: > 0 })
+                    AnsiConsole.MarkupLine("[dim]No tools configured. Use --tools to provide tool definitions.[/]");
+                else
+                {
+                    foreach (var tool in tools)
+                        AnsiConsole.MarkupLine($"[blue]{Markup.Escape(tool.Name)}[/]: {Markup.Escape(tool.Description)}");
+                }
+                continue;
+            }
+
             // Add user message
             history.Add(new ChatMessage { Role = "user", Content = input });
 
-            // Apply chat template to full history
-            string prompt = chatTemplate.Apply(history, new ChatTemplateOptions { AddGenerationPrompt = true });
-
-            // Generate response via streaming
-            var sw = Stopwatch.StartNew();
-            int tokenCount = 0;
-            long firstTokenTicks = 0;
-            var sb = new StringBuilder();
-            FinishReason finishReason = FinishReason.Length;
-            InferenceTimings timings = default;
-            int promptTokenCount = 0;
-
-            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options))
-            {
-                if (tokenCount == 0 && token.Text.Length > 0)
-                    firstTokenTicks = sw.ElapsedTicks;
-                Console.Write(token.Text);
-                sb.Append(token.Text);
-                if (token.FinishReason is null || token.Text.Length > 0)
-                    tokenCount++;
-                if (token.FinishReason.HasValue)
-                {
-                    finishReason = token.FinishReason.Value;
-                    timings = token.Timings ?? default;
-                    promptTokenCount = timings.PrefillTokenCount;
-                }
-            }
-
-            sw.Stop();
-            Console.WriteLine();
-
-            // Strip any remaining stop sequence suffixes from the response text
-            string assistantText = sb.ToString();
-            foreach (var seq in options.StopSequences)
-            {
-                if (assistantText.EndsWith(seq, StringComparison.Ordinal))
-                    assistantText = assistantText[..^seq.Length];
-            }
-
-            // Add assistant response to history
-            history.Add(new ChatMessage { Role = "assistant", Content = assistantText.TrimEnd() });
-
-            // Print timing info
-            double ttftMs = firstTokenTicks > 0 ? firstTokenTicks * 1000.0 / Stopwatch.Frequency : 0;
-            double prefillTokSec = timings.PrefillTokensPerSec;
-            double decodeTokSec = timings.DecodeTokensPerSec;
-            AnsiConsole.MarkupLine(
-                $"[dim][[{promptTokenCount} prompt tokens, {tokenCount} generated tokens, " +
-                $"{ttftMs:F0} ms TTFT, {prefillTokSec:F1} prefill tok/s, {decodeTokSec:F1} decode tok/s]][/]");
-            Console.WriteLine();
+            // Generate (with tool call detection loop)
+            await GenerateAndHandleToolCalls(generator, chatTemplate, options, history, tools, toolCallParser, toolChoice, verbose);
         }
+    }
+
+    private const int MaxToolCallRounds = 5;
+
+    private static Task GenerateAndHandleToolCalls(
+        TextGenerator generator,
+        IChatTemplate chatTemplate,
+        InferenceOptions options,
+        List<ChatMessage> history,
+        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
+        ToolChoice toolChoice,
+        bool verbose)
+        => GenerateAndHandleToolCallsInner(generator, chatTemplate, options, history, tools, toolCallParser, toolChoice, verbose, 0);
+
+    private static async Task GenerateAndHandleToolCallsInner(
+        TextGenerator generator,
+        IChatTemplate chatTemplate,
+        InferenceOptions options,
+        List<ChatMessage> history,
+        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
+        ToolChoice toolChoice,
+        bool verbose,
+        int round)
+    {
+        var templateOptions = new ChatTemplateOptions
+        {
+            AddGenerationPrompt = true,
+            Tools = tools
+        };
+        string prompt = chatTemplate.Apply(history, templateOptions);
+
+        if (verbose)
+            AnsiConsole.MarkupLine($"[dim grey][[verbose]] prompt ({prompt.Length} chars):\n{Markup.Escape(prompt)}[/]");
+
+        // Generate response via streaming
+        var sw = Stopwatch.StartNew();
+        int tokenCount = 0;
+        long firstTokenTicks = 0;
+        var sb = new StringBuilder();
+        // Only suppress streaming output for required/function — model MUST produce a tool call.
+        // For auto, let text flow to the user and detect tool calls post-hoc.
+        bool suppressToolCallText = toolChoice is ToolChoice.Required or ToolChoice.Function;
+        var accumulator = toolCallParser is not null && suppressToolCallText
+            ? new StreamingToolCallAccumulator(toolCallParser) : null;
+        FinishReason finishReason = FinishReason.Length;
+        InferenceTimings timings = default;
+        int promptTokenCount = 0;
+
+        await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options))
+        {
+            if (tokenCount == 0 && token.Text.Length > 0)
+                firstTokenTicks = sw.ElapsedTicks;
+
+            bool suppress = accumulator?.Append(token.Text) ?? false;
+            if (!suppress)
+                Console.Write(token.Text);
+
+            sb.Append(token.Text);
+            if (token.FinishReason is null || token.Text.Length > 0)
+                tokenCount++;
+            if (token.FinishReason.HasValue)
+            {
+                finishReason = token.FinishReason.Value;
+                timings = token.Timings ?? default;
+                promptTokenCount = timings.PrefillTokenCount;
+            }
+        }
+
+        sw.Stop();
+        Console.WriteLine();
+
+        // Strip any remaining stop sequence suffixes from the response text
+        string rawText = sb.ToString();
+        string assistantText = rawText;
+        string? matchedStopSequence = null;
+        foreach (var seq in options.StopSequences)
+        {
+            if (assistantText.EndsWith(seq, StringComparison.Ordinal))
+            {
+                matchedStopSequence = seq;
+                assistantText = assistantText[..^seq.Length];
+                break;
+            }
+        }
+
+        if (verbose)
+        {
+            AnsiConsole.MarkupLine($"[dim grey][[verbose]] finish_reason={finishReason}, tokens={tokenCount}[/]");
+            if (matchedStopSequence is not null)
+                AnsiConsole.MarkupLine($"[dim grey][[verbose]] stopped by: {Markup.Escape(matchedStopSequence)}[/]");
+            if (rawText != assistantText)
+                AnsiConsole.MarkupLine($"[dim grey][[verbose]] raw text: {Markup.Escape(rawText)}[/]");
+        }
+
+        // Check for tool calls
+        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText);
+
+        if (detectedCalls is { Length: > 0 })
+        {
+            finishReason = FinishReason.ToolCalls;
+
+            // Add assistant message with tool calls to history
+            history.Add(new ChatMessage
+            {
+                Role = "assistant",
+                Content = assistantText.TrimEnd(),
+                ToolCalls = detectedCalls
+            });
+
+            // Display detected tool calls
+            AnsiConsole.MarkupLine("[dim]Tool calls detected:[/]");
+            foreach (var tc in detectedCalls)
+            {
+                AnsiConsole.MarkupLine(
+                    $"  [blue][[{Markup.Escape(tc.Id)}]][/] [green]{Markup.Escape(tc.FunctionName)}[/]({Markup.Escape(tc.Arguments)})");
+            }
+
+            // Print timing info for tool call generation
+            PrintTimingInfo(firstTokenTicks, promptTokenCount, tokenCount, timings);
+
+            // Prompt user for tool results
+            bool anyResultProvided = false;
+            foreach (var tc in detectedCalls)
+            {
+                string result;
+                try
+                {
+                    result = AnsiConsole.Prompt(
+                        new TextPrompt<string>($"  [dim]result for[/] [green]{Markup.Escape(tc.FunctionName)}[/] [dim]>>>[/]")
+                            .AllowEmpty());
+                }
+                catch (InvalidOperationException)
+                {
+                    result = "";
+                }
+
+                if (!string.IsNullOrWhiteSpace(result))
+                    anyResultProvided = true;
+
+                history.Add(new ChatMessage
+                {
+                    Role = "tool",
+                    Content = string.IsNullOrWhiteSpace(result) ? "{}" : result,
+                    ToolCallId = tc.Id
+                });
+            }
+
+            // Re-generate with tool results — but guard against infinite loops
+            if (round >= MaxToolCallRounds)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Max tool call rounds ({MaxToolCallRounds}) reached.[/]");
+            }
+            else if (!anyResultProvided)
+            {
+                // User skipped all tool results — don't re-generate, just add placeholder
+                AnsiConsole.MarkupLine("[dim]No tool results provided, skipping re-generation.[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[dim]Generating response with tool results...[/]");
+                await GenerateAndHandleToolCallsInner(generator, chatTemplate, options, history, tools, toolCallParser, toolChoice, verbose, round + 1);
+            }
+        }
+        else
+        {
+            if (verbose && toolCallParser is not null)
+                AnsiConsole.MarkupLine("[dim grey][[verbose]] no tool calls detected by parser[/]");
+
+            // Normal text response — add to history
+            history.Add(new ChatMessage { Role = "assistant", Content = assistantText.TrimEnd() });
+            PrintTimingInfo(firstTokenTicks, promptTokenCount, tokenCount, timings);
+        }
+    }
+
+    private static void PrintTimingInfo(long firstTokenTicks, int promptTokenCount, int tokenCount, InferenceTimings timings)
+    {
+        double ttftMs = firstTokenTicks > 0 ? firstTokenTicks * 1000.0 / Stopwatch.Frequency : 0;
+        double prefillTokSec = timings.PrefillTokensPerSec;
+        double decodeTokSec = timings.DecodeTokensPerSec;
+        AnsiConsole.MarkupLine(
+            $"[dim][[{promptTokenCount} prompt tokens, {tokenCount} generated tokens, " +
+            $"{ttftMs:F0} ms TTFT, {prefillTokSec:F1} prefill tok/s, {decodeTokSec:F1} decode tok/s]][/]");
+        Console.WriteLine();
     }
 
     private static int ResolveGpuLayers(Settings settings, ModelConfig config)
@@ -482,8 +686,68 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         return string.Join(", ", parts);
     }
 
+    internal static ToolDefinition[]? ParseToolDefinitions(string? toolsInput)
+    {
+        if (string.IsNullOrEmpty(toolsInput))
+            return null;
+
+        string json = toolsInput.StartsWith('@')
+            ? File.ReadAllText(toolsInput[1..])
+            : toolsInput;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Array)
+                throw new InvalidOperationException("--tools must be a JSON array of tool definitions.");
+
+            var tools = new List<ToolDefinition>();
+            foreach (var element in root.EnumerateArray())
+            {
+                // Support both flat format and OpenAI-style {"type":"function","function":{...}}
+                JsonElement funcElement = element;
+                if (element.TryGetProperty("type", out var typeProp) &&
+                    typeProp.GetString() == "function" &&
+                    element.TryGetProperty("function", out var funcProp))
+                {
+                    funcElement = funcProp;
+                }
+
+                string name = funcElement.GetProperty("name").GetString()!;
+                string description = funcElement.TryGetProperty("description", out var descProp)
+                    ? descProp.GetString() ?? ""
+                    : "";
+                string parameters = funcElement.TryGetProperty("parameters", out var paramsProp)
+                    ? paramsProp.GetRawText()
+                    : "{}";
+
+                tools.Add(new ToolDefinition(name, description, parameters));
+            }
+            return tools.ToArray();
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException($"Invalid --tools JSON: {ex.Message}");
+        }
+    }
+
+    private static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
+    {
+        return choice.ToLowerInvariant() switch
+        {
+            "auto" => new ToolChoice.Auto(),
+            "none" => new ToolChoice.None(),
+            "required" => new ToolChoice.Required(),
+            _ => tools?.Any(t => t.Name == choice) == true
+                ? new ToolChoice.Function(choice)
+                : throw new InvalidOperationException(
+                    $"Unknown --tool-choice '{choice}'. Use 'auto', 'none', 'required', or a function name.")
+        };
+    }
+
     // Default ChatML template used as fallback when GGUF has no chat_template
-    private const string DefaultChatMlTemplate =
+    internal const string DefaultChatMlTemplateText =
         "{% for message in messages %}" +
         "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}" +
         "{% endfor %}" +

@@ -22,12 +22,23 @@ V_cache[layer][kv_head][max_seq_len][head_dim]  — FP16
 ```
 Simple indexing: `K_cache[layer][head][pos] = new_K`. Wastes memory for short sequences.
 
-## Paged KV-Cache — PagedAttention
+## Paged KV-Cache
 
-Inspired by OS virtual memory paging.
+Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is a future step — current kernels see contiguous buffers via staging-buffer gather.
+
+### Why
+
+**Batch serving memory efficiency**: `SimpleKvCache` pre-allocates `maxSeqLen × layers` per sequence. With 10 concurrent requests averaging 200 tokens but `maxSeqLen=4096`, that's 40K tokens worth of buffers for 2K tokens of actual data — ~95% waste. A shared block pool allocates on demand and reclaims blocks on completion, keeping waste <4%.
+
+**Foundation for downstream steps**: The ref counting and CoW infrastructure enables:
+- **Step 37 (advanced prefix sharing)** — hard requirement. Cross-sequence block sharing (e.g., shared system prompt) is impossible without block tables and ref counting.
+- **Step 43 (speculative decoding)** — benefits from cheap block-level rollback on draft rejection and CoW fork for draft branching, though `SimpleKvCache.SetCurrentLength()` truncation works as a fallback.
+- **Beam search** (future) — beams share prefix blocks via `Fork`, diverge via CoW.
+
+**When it doesn't help**: Single-sequence CLI inference. One sequence uses most of its allocation, and the staging-buffer gather adds overhead. This is why paged is opt-in for `run`/`chat` and default-on only for `serve`.
 
 ### Design
-- Divide cache into fixed-size **blocks** of B tokens (B = 16 or 32).
+- Divide cache into fixed-size **blocks** of B tokens (B = 16).
 - **Block table** per sequence: maps logical positions to physical blocks (page table).
 - **Free pool**: blocks allocated on demand, returned on completion.
 - Memory waste: <4% (vs ~60% for static pre-allocation).
@@ -38,15 +49,38 @@ Inspired by OS virtual memory paging.
 - **Copy-on-write**: For beam search — beams share prefix blocks (ref-counted). On divergence, copy the shared block.
 - **Fork**: For prompt caching — new sequence references existing prefix blocks.
 
-### Attention Integration
-Attention kernels must handle non-contiguous K/V:
+### Attention Integration (v1: Staging Buffer)
+
+Current implementation uses a staging buffer approach: `GetKeysRef()`/`GetValuesRef()` gather block data into a pre-allocated contiguous buffer before each attention call. This avoids modifying attention kernels. The gather cost is O(seqLen × headDim) — negligible compared to attention's O(seqLen² × headDim).
+
+Future optimization: specialized paged attention kernels that read blocks directly via block table indirection, eliminating the staging copy.
+
+### Key Classes
+
+- `KvBlockPool` — Fixed-size pool of KV blocks. Per-layer contiguous storage, 64-byte aligned. Free list with `Interlocked` ref counting for thread safety.
+- `KvBlockTable` — Per-sequence mapping from logical positions to physical block IDs. Supports `Fork` (shared prefix) and `EnsureWritable` (copy-on-write).
+- `PagedKvCache : IKvCache` — Paged cache with staging-buffer gather. Drop-in replacement for `SimpleKvCache`.
+- `PagedKvCacheFactory` — Creates `PagedKvCache` instances backed by a shared `KvBlockPool`.
+
+### CLI
+
 ```
-For each position in the sequence:
-  block_idx = block_table[seq][pos / block_size]
-  offset = pos % block_size
-  K = cache_blocks[block_idx][offset]
+# CLI (run/chat): paged is opt-in
+dotllm chat model.gguf --paged
+
+# Server (serve): paged is on by default, opt-out with --no-paged
+dotllm serve model.gguf                 # paged KV-cache active
+dotllm serve model.gguf --no-paged      # simple KV-cache
+
+# API-only server (no web UI)
+dotllm serve model.gguf --no-ui
 ```
-Paged Flash Attention kernels handle this indirection natively.
+
+### Limitations (v1)
+
+- CPU `PagedKvCache` only. CUDA and hybrid models fall back to their native KV-cache.
+- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`). Falls back to `QuantizedKvCache` with a warning.
+- Staging buffer means `GetKeysRef`/`GetValuesRef` results are only valid until the next call (shared buffer).
 
 ## KV-Cache Quantization
 

@@ -134,6 +134,11 @@ public sealed class TextGenerator
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
 
+        // Stop-check scratch buffer: rented up-front and returned in the outer finally to preserve
+        // the zero-GC-pressure guarantee on the inference hot path.
+        int stopTailSize = ComputeStopTailSize(stopConditions);
+        char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
+
         try
         {
             var generatedIds = new List<int>(maxTokens);
@@ -142,6 +147,10 @@ public sealed class TextGenerator
             long decodeTicks = 0;
             long samplerTicks = 0;
             int cacheSize = kvCache.MaxLength;
+
+            // Incremental detokenizer keeps stop-check cost O(1) amortized per token
+            // instead of decoding the entire generated sequence each step (O(n²)).
+            var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
 
             // Local helper: snapshot log-softmax before sampling (which modifies logits in-place),
             // sample a token, then build logprob info.
@@ -234,9 +243,10 @@ public sealed class TextGenerator
 
             // Check stop conditions for first token
             generatedIds.Add(firstTokenId);
-            string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+            detok.Append(firstTokenId);
 
-            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, decodedText);
+            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds,
+                detok.GetTailView(stopTailSize, stopScratch));
             if (stopResult != StopResult.Continue)
             {
                 if (stopResult == StopResult.Stop)
@@ -255,12 +265,14 @@ public sealed class TextGenerator
 
             int specDrafted = 0, specAccepted = 0;
 
-            // Decode loop (speculative decode disabled when logprobs requested — no per-position logit access)
-            if (_draftModel != null && !captureLogprobs)
+            // Decode loop (speculative decode disabled when logprobs requested — no per-position logit access;
+            // also disabled when sampling isn't effectively greedy, since non-greedy acceptance is not yet
+            // distributionally correct under the sampler pipeline — see Wave 8 / issue #121).
+            if (_draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options))
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
-                    greedy: options.Temperature <= 0f, seed: options.Seed);
+                    greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache draftKvCache = AllocateDraftKvCache(cacheSize);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
                 try
@@ -294,9 +306,10 @@ public sealed class TextGenerator
                         {
                             int tokenId = specBuffer[i];
                             generatedIds.Add(tokenId);
-                            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+                            detok.Append(tokenId);
 
-                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds, decodedText);
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
+                                detok.GetTailView(stopTailSize, stopScratch));
                             if (stopResult != StopResult.Continue)
                             {
                                 if (stopResult == StopResult.Stop)
@@ -359,9 +372,10 @@ public sealed class TextGenerator
                     constraint?.Advance(nextTokenId);
 
                     generatedIds.Add(nextTokenId);
-                    decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+                    detok.Append(nextTokenId);
 
-                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decodedText);
+                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds,
+                        detok.GetTailView(stopTailSize, stopScratch));
                     if (stopResult != StopResult.Continue)
                     {
                         if (stopResult == StopResult.Stop)
@@ -384,6 +398,7 @@ public sealed class TextGenerator
         }
         finally
         {
+            ArrayPool<char>.Shared.Return(stopScratch);
             if (ownsKvCache)
                 kvCache.Dispose();
         }
@@ -460,14 +475,23 @@ public sealed class TextGenerator
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
         long kvBytes = GetKvCacheBytes(kvCache);
 
+        // Stop-check scratch buffer: rented up-front and returned in the outer finally. try/finally
+        // is preserved across yield points by the async-iterator state machine, so Return runs on
+        // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
+        int stopTailSize = ComputeStopTailSize(stopConditions);
+        char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
+
         try
         {
             var generatedIds = new List<int>(maxTokens);
             long prefillTicks = 0;
             long decodeTicks = 0;
             long samplerTicks = 0;
-            int previousDecodeLength = 0;
             int cacheSize = kvCache.MaxLength;
+
+            // Incremental detokenizer: O(1) amortized per token for stop-check + streaming delta,
+            // instead of decoding the full generated sequence at every step.
+            var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
 
             // Local helper: snapshot log-softmax before sampling (which modifies logits in-place),
             // sample a token, then build logprob info.
@@ -557,9 +581,10 @@ public sealed class TextGenerator
 
             // Check stop conditions for first token
             generatedIds.Add(firstTokenId);
-            string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+            detok.Append(firstTokenId);
 
-            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, decodedText);
+            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds,
+                detok.GetTailView(stopTailSize, stopScratch));
             if (stopResult != StopResult.Continue)
             {
                 var fr = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
@@ -575,7 +600,7 @@ public sealed class TextGenerator
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                    string text = decodedText[previousDecodeLength..];
+                    string text = detok.TakeDelta();
                     yield return new GenerationToken(firstTokenId, text, fr, timings, firstLogprobInfo);
                 }
                 yield break;
@@ -584,7 +609,7 @@ public sealed class TextGenerator
             // Yield first token — check if it's also the last (maxTokens == 1)
             {
                 bool firstIsLast = maxTokens <= 1;
-                string text = decodedText[previousDecodeLength..];
+                string text = detok.TakeDelta();
                 if (firstIsLast)
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -592,18 +617,18 @@ public sealed class TextGenerator
                     yield return new GenerationToken(firstTokenId, text, FinishReason.Length, timings, firstLogprobInfo);
                     yield break;
                 }
-                previousDecodeLength = decodedText.Length;
                 yield return new GenerationToken(firstTokenId, text, null, Logprobs: firstLogprobInfo);
             }
 
             int specDrafted = 0, specAccepted = 0;
 
-            // Speculative decode disabled when logprobs requested — no per-position logit access
-            if (_draftModel != null && !captureLogprobs)
+            // Speculative decode disabled when logprobs requested — no per-position logit access.
+            // Also disabled when sampling isn't effectively greedy (see Wave 8 / issue #121).
+            if (_draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options))
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
-                    greedy: options.Temperature <= 0f, seed: options.Seed);
+                    greedy: true, seed: options.Seed);
                 Core.Attention.IKvCache draftKvCache = AllocateDraftKvCache(cacheSize);
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
                 try
@@ -638,9 +663,10 @@ public sealed class TextGenerator
                         {
                             int tokenId = specBuffer[i];
                             generatedIds.Add(tokenId);
-                            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+                            detok.Append(tokenId);
 
-                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds, decodedText);
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
+                                detok.GetTailView(stopTailSize, stopScratch));
                             if (stopResult != StopResult.Continue)
                             {
                                 var fr = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
@@ -656,7 +682,7 @@ public sealed class TextGenerator
                                     specAccepted++;
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    string text = decodedText[previousDecodeLength..];
+                                    string text = detok.TakeDelta();
                                     yield return new GenerationToken(tokenId, text, fr, timings);
                                 }
                                 shouldBreak = true;
@@ -668,7 +694,7 @@ public sealed class TextGenerator
                             // Yield each accepted token
                             {
                                 bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
-                                string text = decodedText[previousDecodeLength..];
+                                string text = detok.TakeDelta();
                                 if (isLastStep && i == result.AcceptedCount - 1)
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -677,7 +703,6 @@ public sealed class TextGenerator
                                     shouldBreak = true;
                                     break;
                                 }
-                                previousDecodeLength = decodedText.Length;
                                 yield return new GenerationToken(tokenId, text, null);
                             }
 
@@ -727,9 +752,10 @@ public sealed class TextGenerator
                     constraint?.Advance(nextTokenId);
 
                     generatedIds.Add(nextTokenId);
-                    decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
+                    detok.Append(nextTokenId);
 
-                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decodedText);
+                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds,
+                        detok.GetTailView(stopTailSize, stopScratch));
                     if (stopResult != StopResult.Continue)
                     {
                         var fr = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
@@ -745,7 +771,7 @@ public sealed class TextGenerator
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                            string text = decodedText[previousDecodeLength..];
+                            string text = detok.TakeDelta();
                             yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob);
                         }
                         yield break;
@@ -754,7 +780,7 @@ public sealed class TextGenerator
                     // Yield token — attach finish reason if this is the last iteration
                     {
                         bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
-                        string text = decodedText[previousDecodeLength..];
+                        string text = detok.TakeDelta();
                         if (isLastStep)
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -762,7 +788,6 @@ public sealed class TextGenerator
                             yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob);
                             yield break;
                         }
-                        previousDecodeLength = decodedText.Length;
                         yield return new GenerationToken(nextTokenId, text, null, Logprobs: tokenLogprob);
                     }
                 }
@@ -770,6 +795,7 @@ public sealed class TextGenerator
         }
         finally
         {
+            ArrayPool<char>.Shared.Return(stopScratch);
             if (ownsKvCache)
                 kvCache.Dispose();
         }
@@ -877,16 +903,37 @@ public sealed class TextGenerator
 
     private static StopResult CheckStopConditions(
         List<IStopCondition> conditions, int tokenId,
-        IReadOnlyList<int> generatedTokens, string decodedText)
+        IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail)
     {
         for (int i = 0; i < conditions.Count; i++)
         {
-            var result = conditions[i].ShouldStop(tokenId, generatedTokens, decodedText);
+            var result = conditions[i].ShouldStop(tokenId, generatedTokens, decodedTail);
             if (result != StopResult.Continue)
                 return result;
         }
         return StopResult.Continue;
     }
+
+    // Tail window passed to stop conditions. Must cover the longest stop string currently
+    // registered; a safety cushion absorbs future stop strings added via custom conditions.
+    private static int ComputeStopTailSize(List<IStopCondition> conditions)
+    {
+        int maxStopLen = 0;
+        for (int i = 0; i < conditions.Count; i++)
+        {
+            if (conditions[i] is StopStringCondition ssc && ssc.StopString.Length > maxStopLen)
+                maxStopLen = ssc.StopString.Length;
+        }
+        return Math.Max(64, maxStopLen + 16);
+    }
+
+    // Speculative decoding's greedy acceptance path matches the target pipeline only when the pipeline
+    // itself is effectively argmax. Temperature <= 0 forces argmax selection; repetition penalty can
+    // shift which token is argmax, so it must also be neutral. Top-k/p/min-p prune low-probability
+    // tokens and never mask the argmax, so they don't need to be checked. Wave 8 / issue #121 lifts
+    // this restriction by making q/p pipeline-aware.
+    private static bool IsEffectivelyGreedy(DotLLM.Core.Configuration.InferenceOptions options)
+        => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
 
     /// <summary>
     /// Prefills the draft model with the full prompt.
